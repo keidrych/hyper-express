@@ -23,7 +23,11 @@ router.post(scenario_endpoint, async (request, response) => {
 
     // Pipe the readable body stream to the writable and wait for it to finish
     request.pipe(writable);
-    await new Promise((resolve) => writable.once('finish', resolve));
+    await new Promise((resolve, reject) => {
+        writable.once('finish', resolve);
+        writable.once('error', reject);
+        request.once('error', reject);
+    });
 
     // Read the written file's buffer and calculate its md5 hash
     const written_buffer = fs.readFileSync(path);
@@ -52,7 +56,7 @@ async function test_request_stream_pipe() {
     const buffer_upload_response = await fetch(endpoint_url, {
         method: 'POST',
         headers: {
-            'x-file-name': 'request_upload_buffer.jpg',
+            'x-file-name': `request_upload_buffer-${process.pid}.jpg`,
         },
         body: expected_buffer,
     });

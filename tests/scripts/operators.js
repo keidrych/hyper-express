@@ -1,5 +1,6 @@
 const crypto = require('crypto');
 const HTTP = require('http');
+const assert = require('node:assert/strict');
 
 function log(logger = 'SYSTEM', message) {
     let dt = new Date();
@@ -19,17 +20,41 @@ function random_string(length = 7) {
     return result.join('');
 }
 
-async function assert_log(group, target, assertion) {
+function assertion_error(group, target, assertion, cause) {
+    return new Error('Failed To Verify ' + target + ' @ ' + group + ' -> ' + assertion.toString(), {
+        cause,
+    });
+}
+
+function assert_log(group, target, assertion) {
+    let result;
     try {
-        let result = await assertion();
-        if (result) {
-            log(group, 'Verified ' + target);
-        } else {
-            throw new Error('Failed To Verify ' + target + ' @ ' + group + ' -> ' + assertion.toString());
-        }
+        result = assertion();
     } catch (error) {
-        console.log(error);
-        throw new Error('Failed To Verify ' + target + ' @ ' + group + ' -> ' + assertion.toString());
+        throw assertion_error(group, target, assertion, error);
+    }
+
+    if (result != null && typeof result.then === 'function') {
+        return Promise.resolve(result).then(
+            (value) => {
+                try {
+                    assert.ok(value, 'Failed To Verify ' + target + ' @ ' + group);
+                    log(group, 'Verified ' + target);
+                } catch (error) {
+                    throw assertion_error(group, target, assertion, error);
+                }
+            },
+            (error) => {
+                throw assertion_error(group, target, assertion, error);
+            }
+        );
+    }
+
+    try {
+        assert.ok(result, 'Failed To Verify ' + target + ' @ ' + group + ' -> ' + assertion.toString());
+        log(group, 'Verified ' + target);
+    } catch (error) {
+        throw assertion_error(group, target, assertion, error);
     }
 }
 

@@ -12,16 +12,98 @@ const WebsocketRoute = require('./ws/WebsocketRoute.js');
 
 const { wrap_object, to_forward_slashes } = require('../shared/operators.js');
 
+const BOOLEAN_OPTIONS = [
+    'auto_close',
+    'exclusive_port',
+    'fast_abort',
+    'strict_middleware',
+    'trust_proxy',
+    'fast_buffers',
+    'ssl_prefer_low_memory_usage',
+];
+const STRING_OPTIONS = [
+    'cert_file_name',
+    'key_file_name',
+    'passphrase',
+    'dh_params_file_name',
+    'ca_file_name',
+    'ssl_ciphers',
+];
+
+function validate_server_options(options) {
+    for (const name of BOOLEAN_OPTIONS) {
+        if (
+            Object.prototype.hasOwnProperty.call(options, name) &&
+            typeof options[name] !== 'boolean'
+        )
+            throw new TypeError(`HyperExpress.Server option ${name} must be a boolean.`);
+    }
+
+    for (const name of ['max_body_buffer', 'max_body_length']) {
+        if (
+            Object.prototype.hasOwnProperty.call(options, name) &&
+            (!Number.isSafeInteger(options[name]) || options[name] < 0)
+        )
+            throw new RangeError(
+                `HyperExpress.Server option ${name} must be a non-negative safe integer.`
+            );
+    }
+
+    for (const name of STRING_OPTIONS) {
+        if (
+            Object.prototype.hasOwnProperty.call(options, name) &&
+            (typeof options[name] !== 'string' || options[name].includes('\0'))
+        )
+            throw new TypeError(
+                `HyperExpress.Server option ${name} must be a string without null bytes.`
+            );
+    }
+
+    if (
+        Object.prototype.hasOwnProperty.call(options, 'streaming') &&
+        (options.streaming === null ||
+            typeof options.streaming !== 'object' ||
+            Array.isArray(options.streaming))
+    )
+        throw new TypeError('HyperExpress.Server option streaming must be an object.');
+
+    const has_certificate = Object.prototype.hasOwnProperty.call(options, 'cert_file_name');
+    const has_private_key = Object.prototype.hasOwnProperty.call(options, 'key_file_name');
+    if (has_certificate || has_private_key) {
+        if (
+            !has_certificate ||
+            !has_private_key ||
+            typeof options.cert_file_name !== 'string' ||
+            !options.cert_file_name.length ||
+            typeof options.key_file_name !== 'string' ||
+            !options.key_file_name.length
+        )
+            throw new TypeError(
+                'HyperExpress.Server TLS configuration requires non-empty cert_file_name and key_file_name strings.'
+            );
+    }
+}
+
 class Server extends Router {
     #port;
     #hosts;
     #uws_instance;
     #listen_socket;
+    #has_websocket_routes = false;
+    #descriptor;
+    #owned_listen_sockets = new WeakSet();
+    #closed_listen_sockets = new WeakSet();
+    #auto_close_handlers = new Map();
+    #shutdown_promise;
+    #shutdown_resolve;
+    #shutdown_result = false;
+    #shutting_down = false;
     #options = {
         is_ssl: false,
         auto_close: true,
         exclusive_port: false,
         fast_abort: false,
+        strict_middleware: false,
         trust_proxy: false,
         fast_buffers: false,
         max_body_buffer: 16 * 1024,
@@ -36,6 +118,12 @@ class Server extends Router {
     _options = null;
 
     /**
+     * Server-owned live file cache. Deleting or replacing an entry disposes its watcher.
+     * @private
+     */
+    _file_pool;
+
+    /**
      * @param {Object} options Server Options
      * @param {String=} options.cert_file_name Path to SSL certificate file to be used for SSL/TLS.
      * @param {String=} options.key_file_name Path to SSL private key file to be used for SSL/TLS.
@@ -44,6 +132,7 @@ class Server extends Router {
      * @param {Boolean=} options.ssl_prefer_low_memory_usage Specifies uWebSockets to prefer lower memory usage while serving SSL.
      * @param {Boolean=} options.fast_buffers Buffer.allocUnsafe is used when set to true for faster performance.
      * @param {Boolean=} options.fast_abort Determines whether HyperExpress will abrubptly close bad requests. This can be much faster but the client does not receive an HTTP status code as it is a premature connection closure.
+     * @param {Boolean=} options.strict_middleware Reports duplicate middleware completion to the scoped error handler. Default: false.
      * @param {Boolean=} options.trust_proxy Specifies whether to trust incoming request data from intermediate proxy(s)
      * @param {Number=} options.max_body_buffer Maximum body content to buffer in memory before a request data is handled. Behaves similar to `highWaterMark` in Node.js streams.
      * @param {Number=} options.max_body_length Maximum body content length allowed in bytes. For Reference: 1kb = 1024 bytes and 1mb = 1024kb.
@@ -54,20 +143,41 @@ class Server extends Router {
      * @param {import('stream').WritableOptions=} options.streaming.writable Global content streaming options for Writable streams.
      */
     constructor(options = {}) {
-        if (options == null || typeof options !== 'object')
+        if (options == null || typeof options !== 'object' || Array.isArray(options))
             throw new Error(
                 'HyperExpress: HyperExpress.Server constructor only accepts an object type for the options parameter.'
             );
 
+        // Snapshot top-level accessors once into a null-prototype data object before validation
+        // or native option translation.
+        options = Object.assign(Object.create(null), options);
+        validate_server_options(options);
+
         super();
         super._is_app(true);
+
+        const file_pool = Object.create(null);
+        this._file_pool = new Proxy(file_pool, {
+            deleteProperty(target, key) {
+                const live_file = target[key];
+                if (live_file && typeof live_file.close === 'function') live_file.close();
+                return Reflect.deleteProperty(target, key);
+            },
+            set(target, key, live_file) {
+                const previous = target[key];
+                if (previous && previous !== live_file && typeof previous.close === 'function')
+                    previous.close();
+                target[key] = live_file;
+                return true;
+            },
+        });
 
         // Merge user options into defaults and expose them to request lifecycle components
         wrap_object(this.#options, options);
         this._options = this.#options;
         try {
             const { cert_file_name, key_file_name } = options;
-            this.#options.is_ssl = cert_file_name && key_file_name; // cert and key are required for SSL
+            this.#options.is_ssl = Boolean(cert_file_name && key_file_name);
             if (this.#options.is_ssl) {
                 // uWS expects normalized absolute paths for TLS certificate files
                 this.#options.cert_file_name = to_forward_slashes(path.resolve(cert_file_name));
@@ -106,11 +216,28 @@ class Server extends Router {
      * This method binds a cleanup handler which automatically closes this Server instance.
      */
     _bind_auto_close() {
+        if (this.#auto_close_handlers.size) return false;
+
         const reference = this;
         const exit_events = ['exit', 'SIGINT', 'SIGUSR1', 'SIGUSR2', 'SIGTERM'];
         for (const event_type of exit_events) {
-            process.once(event_type, () => reference.close());
+            const handler = () => reference.force_close();
+            this.#auto_close_handlers.set(event_type, handler);
+            process.once(event_type, handler);
         }
+        return true;
+    }
+
+    /** @private */
+    _unbind_auto_close() {
+        for (const [event_type, handler] of this.#auto_close_handlers)
+            process.removeListener(event_type, handler);
+        this.#auto_close_handlers.clear();
+    }
+
+    /** @private */
+    _dispose_file_pool() {
+        for (const cache_key of Object.keys(this._file_pool)) delete this._file_pool[cache_key];
     }
 
     /**
@@ -122,32 +249,77 @@ class Server extends Router {
      * @returns {Promise<import('uWebSockets.js').us_listen_socket>} Promise which resolves to the listen socket when the server is listening.
      */
     async listen(first, second, third) {
-        let port;
-        let path;
+        if (this.#listen_socket)
+            throw new Error('HyperExpress.Server.listen(): This server is already listening.');
+        if (this.#shutting_down)
+            throw new Error(
+                'HyperExpress.Server.listen(): Cannot listen while a graceful shutdown is in progress.'
+            );
 
-        // Parse the overloaded port or UNIX socket argument
-        if (typeof first == 'number' || (+first > 0 && +first < 65536)) {
-            port = typeof first == 'string' ? +first : first;
-        } else if (typeof first == 'string') {
-            path = first;
-        }
+        let port;
+        let socket_path;
+
+        // Parse the overloaded port or UNIX socket argument without allowing malformed numeric
+        // strings to fall through as accidental filesystem paths.
+        if (typeof first === 'number') {
+            if (!Number.isInteger(first) || first < 0 || first >= 65536)
+                throw new RangeError(
+                    'HyperExpress.Server.listen(): TCP ports must be integers from 0 through 65535.'
+                );
+            port = first;
+        } else if (typeof first === 'string') {
+            const trimmed = first.trim();
+            const numeric = Number(trimmed);
+            if (/^\d+$/.test(trimmed)) {
+                if (!Number.isInteger(numeric) || numeric < 0 || numeric >= 65536)
+                    throw new RangeError(
+                        'HyperExpress.Server.listen(): TCP ports must be integers from 0 through 65535.'
+                    );
+                port = numeric;
+            } else if (trimmed && Number.isFinite(numeric)) {
+                throw new RangeError(
+                    'HyperExpress.Server.listen(): TCP port strings must contain decimal digits only.'
+                );
+            } else if (trimmed && !first.includes('\0')) {
+                socket_path = first;
+            } else {
+                throw new TypeError(
+                    'HyperExpress.Server.listen(): Unix socket paths cannot be empty.'
+                );
+            }
+        } else
+            throw new TypeError(
+                'HyperExpress.Server.listen(): The first argument must be a valid TCP port or Unix socket path.'
+            );
 
         let host = '0.0.0.0';
         let callback;
-        if (second) {
+        if (second !== undefined) {
             // The second argument can be either a callback or a host followed by a callback
             if (typeof second === 'function') {
+                if (third !== undefined)
+                    throw new TypeError(
+                        'HyperExpress.Server.listen(): The third argument is only valid after a hostname.'
+                    );
                 callback = second;
             } else {
-                if (typeof second == 'string') {
+                if (
+                    typeof second === 'string' &&
+                    second.trim().length &&
+                    !second.includes('\0')
+                ) {
                     host = second;
                 } else {
-                    throw new Error(
-                        `HyperExpress.Server.listen(): The second argument must either be a callback function or a string as a hostname.`
+                    throw new TypeError(
+                        'HyperExpress.Server.listen(): The second argument must either be a callback function or a non-empty hostname string.'
                     );
                 }
 
-                if (third && typeof third === 'function') callback = third;
+                if (third !== undefined && typeof third !== 'function')
+                    throw new TypeError(
+                        'HyperExpress.Server.listen(): The third argument must be a callback function.'
+                    );
+                if (third) callback = third;
             }
         }
 
@@ -165,22 +337,55 @@ class Server extends Router {
 
         // Bind with the uWS API matching the parsed TCP or UNIX socket target
         const reference = this;
+        this.#port = undefined;
+
         return await new Promise((resolve, reject) => {
             const on_listen_socket = (listen_socket) => {
-                // Freeze and compile routing structures before accepting requests
-                reference._compile();
-
                 if (listen_socket) {
-                    reference.#listen_socket = listen_socket;
+                    try {
+                        reference.#owned_listen_sockets.add(listen_socket);
+                        // Freeze and compile routing structures before accepting requests
+                        reference._compile();
+                        reference.#shutdown_promise = undefined;
+                        reference.#shutdown_resolve = undefined;
+                        reference.#shutdown_result = false;
+                        reference.#pending_requests_zero_handler = null;
+                        reference.#listen_socket = listen_socket;
 
-                    if (reference.#options.auto_close) reference._bind_auto_close();
+                        if (reference.#options.auto_close) reference._bind_auto_close();
 
-                    if (callback) callback(listen_socket);
+                        if (callback) {
+                            const output = callback(listen_socket);
+                            if (output instanceof Error) throw output;
+                            if (output != null && typeof output.then === 'function') {
+                                Promise.resolve(output).then(
+                                    (value) => {
+                                        if (value instanceof Error) {
+                                            reference._stop_listening(listen_socket);
+                                            reject(value);
+                                        } else {
+                                            resolve(listen_socket);
+                                        }
+                                    },
+                                    (error) => {
+                                        reference._stop_listening(listen_socket);
+                                        reject(error);
+                                    }
+                                );
+                                return;
+                            }
+                        }
 
-                    resolve(listen_socket);
+                        resolve(listen_socket);
+                    } catch (error) {
+                        reference._stop_listening(listen_socket);
+                        reject(error);
+                    }
                 } else {
                     reject(
-                        'HyperExpress.Server.listen(): No Socket Received From uWebsockets.js likely due to an invalid host or busy port.'
+                        new Error(
+                            'HyperExpress.Server.listen(): No socket was received from uWebSockets.js, likely because the address is invalid or already in use.'
+                        )
                     );
                 }
             };
@@ -190,7 +395,9 @@ class Server extends Router {
                     // uWebSockets.js only supports listen options without a custom host
                     if (host !== '0.0.0.0')
                         return reject(
-                            'HyperExpress.Server.listen(): A custom host cannot be used with the exclusive_port option.'
+                            new Error(
+                                'HyperExpress.Server.listen(): A custom host cannot be used with the exclusive_port option.'
+                            )
                         );
 
                     reference.#uws_instance.listen(
@@ -202,33 +409,66 @@ class Server extends Router {
                     reference.#uws_instance.listen(host, port, on_listen_socket);
                 }
             } else {
-                reference.#uws_instance.listen_unix(on_listen_socket, path);
+                reference.#uws_instance.listen_unix(on_listen_socket, socket_path);
             }
         });
     }
 
-    #shutdown_promise;
     /**
-     * Performs a graceful shutdown of the server and closes the listen socket once all pending requests have been completed.
+     * Stops accepting new connections immediately, then waits for active HTTP requests.
+     * WebSockets are intentionally not part of graceful HTTP request accounting.
      * @param {uWebSockets.us_listen_socket=} listen_socket Optional
      * @returns {Promise<boolean>}
      */
     shutdown(listen_socket) {
-        // If we already have a shutdown promise in flight, return it
         if (this.#shutdown_promise) return this.#shutdown_promise;
 
-        // If we have no pending requests, we can shutdown immediately
-        if (!this.#pending_requests_count) return Promise.resolve(this.close(listen_socket));
+        const stopped = this._stop_listening(listen_socket);
+        // An explicit stale or foreign token must not transition this server into shutdown while
+        // its actual listener remains active.
+        if (listen_socket && !stopped) return Promise.resolve(false);
 
-        // Defer closure until the final active request completes
-        const scope = this;
-        this.#shutdown_promise = new Promise((resolve) => {
-            scope.#pending_requests_zero_handler = () => {
-                resolve(scope.close(listen_socket));
-            };
-        });
+        this.#shutting_down = true;
+        this.#shutdown_result = stopped;
+        this.#shutdown_promise = new Promise((resolve) => (this.#shutdown_resolve = resolve));
+        this.#pending_requests_zero_handler = () => this._finish_shutdown();
+
+        if (!this.#pending_requests_count) this._finish_shutdown();
 
         return this.#shutdown_promise;
+    }
+
+    /** @private */
+    _finish_shutdown() {
+        if (!this.#shutting_down) return false;
+        this.#shutting_down = false;
+        this.#pending_requests_zero_handler = null;
+        this._dispose_file_pool();
+
+        const resolve = this.#shutdown_resolve;
+        this.#shutdown_resolve = undefined;
+        if (resolve) resolve(this.#shutdown_result);
+        return true;
+    }
+
+    /** @private */
+    _stop_listening(listen_socket) {
+        const socket = listen_socket || this.#listen_socket;
+        if (
+            !socket ||
+            !this.#owned_listen_sockets.has(socket) ||
+            this.#closed_listen_sockets.has(socket)
+        )
+            return false;
+
+        this.#closed_listen_sockets.add(socket);
+        uWebSockets.us_listen_socket_close(socket);
+        if (!listen_socket || socket === this.#listen_socket) {
+            this.#listen_socket = null;
+            this.#port = undefined;
+            this._unbind_auto_close();
+        }
+        return true;
     }
 
     /**
@@ -238,16 +478,25 @@ class Server extends Router {
      * @returns {Boolean}
      */
     close(listen_socket) {
-        const socket = listen_socket || this.#listen_socket;
-        if (socket) {
-            uWebSockets.us_listen_socket_close(socket);
+        const closed = this._stop_listening(listen_socket);
+        if (!this.#shutting_down) this._dispose_file_pool();
+        return closed;
+    }
 
-            // Preserve externally supplied socket ownership
-            if (!listen_socket) this.#listen_socket = null;
-
-            return true;
-        }
-        return false;
+    /**
+     * Forcefully closes all native listen, HTTP, and WebSocket sockets owned by this app.
+     * @returns {Boolean} Always true after native close has been invoked.
+     */
+    force_close() {
+        if (this.#listen_socket) this.#closed_listen_sockets.add(this.#listen_socket);
+        this.#uws_instance.close();
+        this.#listen_socket = null;
+        this.#port = undefined;
+        this.#pending_requests_count = 0;
+        this._unbind_auto_close();
+        this._dispose_file_pool();
+        if (this.#shutting_down) this._finish_shutdown();
+        return true;
     }
 
     #routes_locked = false;
@@ -272,6 +521,7 @@ class Server extends Router {
     set_error_handler(handler) {
         if (typeof handler !== 'function') throw new Error('HyperExpress: handler must be a function');
         this.#handlers.on_error = handler;
+        return this;
     }
 
     /**
@@ -287,6 +537,7 @@ class Server extends Router {
     set_not_found_handler(handler) {
         if (typeof handler !== 'function') throw new Error('HyperExpress: handler must be a function');
         this.#handlers.on_not_found = handler;
+        return this;
     }
 
     /**
@@ -300,6 +551,7 @@ class Server extends Router {
      * @returns {Boolean}
      */
     publish(topic, message, is_binary, compress) {
+        if (!this.#has_websocket_routes) return false;
         return this.#uws_instance.publish(topic, message, is_binary, compress);
     }
 
@@ -310,27 +562,57 @@ class Server extends Router {
      * @returns {Number}
      */
     num_of_subscribers(topic) {
+        if (!this.#has_websocket_routes) return 0;
         return this.#uws_instance.numSubscribers(topic);
+    }
+
+    /** Returns the native application descriptor for worker distribution. */
+    get_descriptor() {
+        // The addon allocates a permanent V8 Persistent every time getDescriptor() is called.
+        // The encoded app pointer is stable, so one read avoids an unbounded native-side leak.
+        if (this.#descriptor === undefined) this.#descriptor = this.#uws_instance.getDescriptor();
+        return this.#descriptor;
+    }
+
+    /** Adds a child application descriptor for worker distribution. */
+    add_child_app_descriptor(descriptor) {
+        if (typeof descriptor !== 'number' || !Number.isFinite(descriptor) || descriptor === 0)
+            throw new TypeError(
+                'HyperExpress.Server.add_child_app_descriptor(): descriptor must be a non-zero finite uWebSockets.js AppDescriptor.'
+            );
+        this.#uws_instance.addChildAppDescriptor(descriptor);
+        return this;
+    }
+
+    /** Removes a child application descriptor from worker distribution. */
+    remove_child_app_descriptor(descriptor) {
+        if (typeof descriptor !== 'number' || !Number.isFinite(descriptor) || descriptor === 0)
+            throw new TypeError(
+                'HyperExpress.Server.remove_child_app_descriptor(): descriptor must be a non-zero finite uWebSockets.js AppDescriptor.'
+            );
+        this.#uws_instance.removeChildAppDescriptor(descriptor);
+        return this;
     }
 
     /* Server Routes & Middlewares Logic */
 
-    #middlewares = {
+    #middlewares = Object.assign(Object.create(null), {
         '/': [], // This will contain global middlewares
-    };
+    });
 
     #routes = {
-        any: {},
-        get: {},
-        post: {},
-        del: {},
-        head: {},
-        options: {},
-        patch: {},
-        put: {},
-        trace: {},
-        upgrade: {},
-        ws: {},
+        any: Object.create(null),
+        get: Object.create(null),
+        post: Object.create(null),
+        del: Object.create(null),
+        head: Object.create(null),
+        options: Object.create(null),
+        patch: Object.create(null),
+        put: Object.create(null),
+        trace: Object.create(null),
+        connect: Object.create(null),
+        upgrade: Object.create(null),
+        ws: Object.create(null),
     };
 
     #incremented_id = 0;
@@ -352,7 +634,7 @@ class Server extends Router {
      * @param {Object} record { method, pattern, options, handler }
      */
     _create_route(record) {
-        const { method, pattern, options, handler } = record;
+        const { method, pattern, options, handler, error_scopes = [] } = record;
 
         // Do not allow route creation once it is locked after a not found handler has been bound
         if (this.#routes_locked === true)
@@ -373,6 +655,7 @@ class Server extends Router {
             pattern,
             options,
             handler,
+            error_scopes,
         });
 
         // Mark route as temporary if specified from options
@@ -387,6 +670,7 @@ class Server extends Router {
                     handler,
                     options,
                 });
+                this.#has_websocket_routes = true;
                 break;
             case 'upgrade':
                 // Throw an error if an upgrade route already exists that was not created by WebsocketRoute
@@ -424,7 +708,7 @@ class Server extends Router {
         // Do not allow middleware creation after routing structures have been compiled
         if (this.#routes_locked === true)
             throw new Error(
-                `HyperExpress: Routes/Routers must not be created or used after the Server.listen() has been called. [${method.toUpperCase()} ${pattern}]`
+                `HyperExpress: Routes/Routers must not be created or used after the Server.listen() has been called. [MIDDLEWARE ${pattern}]`
             );
 
         if (this.#middlewares[pattern] == undefined) this.#middlewares[pattern] = [];
@@ -439,16 +723,75 @@ class Server extends Router {
         this.#middlewares[pattern].push(object);
     }
 
+    #router_mounts = [];
+
+    /**
+     * Records a router mount boundary for scoped not-found selection.
+     * @private
+     */
+    _create_router_mount(record) {
+        if (this.#routes_locked === true)
+            throw new Error(
+                `HyperExpress: Routes/Routers must not be created or used after the Server.listen() has been called. [ROUTER ${record.pattern}]`
+            );
+
+        this.#router_mounts.push({
+            pattern: record.pattern,
+            scopes: [...record.scopes],
+        });
+        return this;
+    }
+
+    /**
+     * Runs the not-found handler selected by longest matching router mount boundary.
+     * @private
+     */
+    _handle_not_found(request, response) {
+        let selected;
+        for (const mount of this.#router_mounts) {
+            const pattern = mount.pattern;
+            const matches =
+                pattern === '/' || request.path === pattern || request.path.startsWith(pattern + '/');
+
+            if (matches && (!selected || pattern.length > selected.pattern.length)) selected = mount;
+        }
+
+        const scopes = selected ? selected.scopes : [];
+        let handler;
+        for (const scope of scopes) {
+            handler = scope._get_not_found_handler();
+            if (handler) break;
+        }
+        if (!handler) handler = this.#handlers.on_not_found;
+
+        const on_error = (error) => response.route.handle_error(request, response, error, scopes);
+        try {
+            const output = handler(request, response);
+            if (output != null && typeof output.then === 'function') {
+                Promise.resolve(output).then(
+                    (value) => {
+                        if (value instanceof Error) on_error(value);
+                    },
+                    on_error
+                );
+            }
+        } catch (error) {
+            on_error(error);
+        }
+    }
+
     /**
      * Compiles the route and middleware structures for this instance for use in the uWS server.
      * Note! This method will lock any future creation of routes or middlewares.
      * @private
      */
     _compile() {
+        if (this.#routes_locked) return false;
+
         // Bind the not found handler as a catchall route if the user did not already bind a global ANY catchall route
         if (this.#handlers.on_not_found) {
             const exists = this.#routes.any['/*'] !== undefined;
-            if (!exists) this.any('/*', (request, response) => this.#handlers.on_not_found(request, response));
+            if (!exists) this.any('/*', (request, response) => this._handle_not_found(request, response));
         }
 
         // Compile every registered route grouped by HTTP method and pattern
@@ -466,6 +809,7 @@ class Server extends Router {
 
         // Lock routes from further creation
         this.#routes_locked = true;
+        return true;
     }
 
     /* uWS -> Server Request/Response Handling Logic */
@@ -496,29 +840,55 @@ class Server extends Router {
      * @param {uWebSockets.us_socket_context_t=} socket
      */
     _handle_uws_request(route, uws_request, uws_response, socket) {
-        const request = new Request(route, uws_request);
-        request._raw_response = uws_response;
+        let response;
+        try {
+            const request = new Request(route, uws_request);
+            request._raw_response = uws_response;
 
-        const response = new Response(uws_response);
-        response.route = route;
-        response._wrapped_request = request;
-        response._upgrade_socket = socket || null;
+            response = new Response(uws_response);
+            response.route = route;
+            response._wrapped_request = request;
+            response._upgrade_socket = socket || null;
 
-        // If we are in the process of gracefully shutting down, we must immediately close the request
-        if (this.#pending_requests_zero_handler) return response.close();
+            this.#pending_requests_count++;
 
-        this.#pending_requests_count++;
+            // Capture every connection-derived value before uWS can invalidate this HttpResponse.
+            // This also makes request address getters stable after send, abort, or upgrade.
+            request._capture_connection_metadata();
 
-        // Enter the route lifecycle only when body parsing remains within its configured limit
-        if (request._body_parser_run(response, route.max_body_length)) {
-            route.handle(request, response);
+            // Account for a request that raced with listen-socket closure before rejecting it.
+            if (this.#shutdown_promise) return response.close();
 
-            // Defer future writes through cork when handling continues asynchronously
-            if (!response.completed) response._cork = true;
+            // Enter the route lifecycle only when body parsing remains within its configured limit
+            if (request._body_parser_run(response, route.max_body_length)) {
+                route.handle(request, response);
+
+                // Defer future writes through cork when handling continues asynchronously
+                if (!response.completed) response._cork = true;
+            }
+        } catch (error) {
+            // No exception may cross a callback entered by uWebSockets.js. Once the wrappers exist,
+            // route through normal error handling; constructor failures close the raw response.
+            if (response) {
+                try {
+                    response.throw(error);
+                } catch {
+                    if (!response.completed) response.close();
+                }
+            } else {
+                try {
+                    uws_response.close();
+                } catch {}
+            }
         }
     }
 
     /* Safe Server Getters */
+
+    /** Returns whether this server uses uWebSockets.js SSLApp. */
+    get is_ssl() {
+        return this.#options.is_ssl;
+    }
 
     /**
      * Returns the local server listening port of the server instance.

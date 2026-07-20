@@ -1,16 +1,32 @@
 'use strict';
-const crypto = require('crypto');
 const cookie = require('cookie');
 const signature = require('cookie-signature');
 const status_codes = require('http').STATUS_CODES;
 const mime_types = require('mime-types');
 const stream = require('stream');
+const Path = require('path');
+
+function validate_header_name(name) {
+    if (typeof name !== 'string' || !/^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/.test(name))
+        throw new TypeError('HyperExpress.Response.header(name) requires a valid HTTP field name.');
+}
+
+function validate_header_values(value) {
+    const values = Array.isArray(value) ? value : [value];
+    for (const candidate of values) {
+        if (typeof candidate !== 'string')
+            throw new TypeError(
+                'HyperExpress.Response header values must be strings or arrays of strings.'
+            );
+        if (/\r|\n/.test(candidate))
+            throw new TypeError('HyperExpress.Response header values cannot contain CR or LF characters.');
+    }
+}
 
 const NodeResponse = require('../compatibility/NodeResponse.js');
 const ExpressResponse = require('../compatibility/ExpressResponse.js');
-const { inherit_prototype } = require('../../shared/operators.js');
+const { inherit_prototype, array_buffer_to_string } = require('../../shared/operators.js');
 
-const FilePool = {};
 const LiveFile = require('../plugins/LiveFile.js');
 const SSEventStream = require('../plugins/SSEventStream.js');
 
@@ -20,6 +36,13 @@ class Response {
     route = null;
     _corked = false;
     _streaming = false;
+    _aborted = false;
+    _pending_resolved = false;
+    _finish_emitted = false;
+    _close_emitted = false;
+    _deferred_send;
+    _finalizing_writable = false;
+    _piped_sources;
     _middleware_cursor;
     _wrapped_request = null;
     _upgrade_socket = null;
@@ -44,7 +67,7 @@ class Response {
      * @private
      * @type {Record<string, string|string[]}
      */
-    _headers = {};
+    _headers = Object.create(null);
 
     /**
      * Contains underlying cookies for the response.
@@ -88,19 +111,76 @@ class Response {
 
         // uWS requires an abort handler before the response can outlive its synchronous callback
         raw_response.onAborted(() => {
-            if (this.completed) return;
-            this.completed = true;
-
-            // Release server and request lifecycle state before notifying user listeners
-            this.route.app._resolve_pending_request();
-
-            this._wrapped_request._body_parser_stop();
-
-            if (this._writable) {
-                this.emit('abort', this._wrapped_request, this);
-                this.emit('close', this._wrapped_request, this);
-            }
+            const error = new Error('HyperExpress: Request was aborted before its lifecycle completed.');
+            error.code = 'ERR_REQUEST_ABORTED';
+            this._complete_response({ aborted: true, error });
         });
+    }
+
+    /**
+     * Emits lifecycle events without allowing user listeners to throw through a native callback.
+     * @private
+     * @param {String} event
+     */
+    _emit_lifecycle(event) {
+        if (!this._writable) return;
+        if (event === 'finish') {
+            if (this._finish_emitted || this._writable.writableFinished) return;
+            this._finish_emitted = true;
+        } else if (event === 'close') {
+            if (this._close_emitted) return;
+            this._close_emitted = true;
+        }
+
+        try {
+            this.emit(event, this._wrapped_request, this);
+        } catch (error) {
+            setImmediate(() => this.route.handle_error(this._wrapped_request, this, error));
+        }
+    }
+
+    /**
+     * Finalizes request accounting and response events exactly once.
+     * @private
+     * @param {Object=} options
+     * @param {Boolean=} options.aborted
+     * @param {Error=} options.error
+     * @param {Boolean=} options.emit_finish
+     * @param {Boolean=} options.emit_close
+     * @returns {Boolean}
+     */
+    _complete_response(options) {
+        if (this.completed) return false;
+
+        const aborted = options?.aborted === true;
+        const error = options?.error;
+        const emit_finish = options?.emit_finish ?? !aborted;
+        const emit_close = options?.emit_close ?? true;
+
+        this.completed = true;
+        this._aborted = aborted;
+        this._drain_handler = null;
+        this._wrapped_request._mark_ended();
+
+        if (error) this._wrapped_request._body_parser_stop(error);
+
+        if (!this._pending_resolved) {
+            this._pending_resolved = true;
+            this.route.app._resolve_pending_request();
+        }
+
+        if (aborted) this._emit_lifecycle('abort');
+        if (emit_finish) this._emit_lifecycle('finish');
+        if (emit_close) {
+            // Error completion must tear down the Node Writable so ordinary readable.pipe(response)
+            // pipelines unpipe and release their source resources.
+            if (error && this._writable) {
+                if (!this._writable.destroyed) this._writable.destroy();
+            } else {
+                this._emit_lifecycle('close');
+            }
+        }
+        return true;
     }
 
     /* HyperExpress Methods */
@@ -133,7 +213,24 @@ class Response {
      * @returns {Response} Response (Chainable)
      */
     atomic(handler) {
-        if (!this.completed) this._raw_response.cork(handler);
+        if (typeof handler !== 'function')
+            throw new TypeError('HyperExpress.Response.atomic(handler) requires a function.');
+
+        if (!this.completed)
+            this._raw_response.cork(() => {
+                try {
+                    const output = handler();
+                    if (output != null && typeof output.then === 'function')
+                        Promise.resolve(output).then(
+                            (value) => {
+                                if (value instanceof Error) this.throw(value);
+                            },
+                            (error) => this.throw(error)
+                        );
+                } catch (error) {
+                    this.throw(error);
+                }
+            });
         return this;
     }
 
@@ -145,6 +242,15 @@ class Response {
      * @returns {Response} Response (Chainable)
      */
     status(code, message) {
+        if (!Number.isInteger(code) || code < 100 || code > 999)
+            throw new RangeError('HyperExpress.Response.status(code) requires an integer from 100 to 999.');
+        if (message !== undefined) {
+            if (typeof message !== 'string')
+                throw new TypeError('HyperExpress.Response.status(code, message) requires a string message.');
+            if (/\r|\n/.test(message))
+                throw new TypeError('HyperExpress.Response status messages cannot contain CR or LF characters.');
+        }
+
         // Defer status serialization until response initiation
         this._status_code = code;
         this._status_message = message;
@@ -173,12 +279,15 @@ class Response {
      * @returns {Response} Response (Chainable)
      */
     header(name, value, overwrite) {
+        validate_header_name(name);
+        validate_header_values(value);
+
         name = name.toLowerCase();
+        const has_header = Object.prototype.hasOwnProperty.call(this._headers, name);
 
         if (overwrite) {
             this._headers[name] = value;
-
-        } else if (this._headers[name]) {
+        } else if (has_header) {
             if (Array.isArray(this._headers[name])) {
                 if (Array.isArray(value)) {
                     this._headers[name] = this._headers[name].concat(value);
@@ -187,7 +296,9 @@ class Response {
                 }
             } else {
                 // Preserve repeated header values rather than overwriting the first
-                this._headers[name] = [this._headers[name], value];
+                this._headers[name] = Array.isArray(value)
+                    ? [this._headers[name], ...value]
+                    : [this._headers[name], value];
             }
         } else {
             this._headers[name] = value;
@@ -219,12 +330,6 @@ class Response {
      * @returns {Response} Response (Chainable)
      */
     cookie(name, value, expiry, options, sign_cookie = true) {
-        // A null value expires the cookie using the same serialization path
-        if (name && value === null)
-            return this.cookie(name, '', null, {
-                maxAge: 0,
-            });
-
         // Copy caller options before applying derived expiry and signing values
         options = options
             ? { ...options }
@@ -234,20 +339,29 @@ class Response {
                   path: '/',
               };
 
-        if (typeof expiry == 'number') {
-            options.expires = options.expires || new Date(Date.now() + expiry);
+        const deleting = value === null;
+        if (deleting) {
+            value = '';
+            options.maxAge = 0;
+            sign_cookie = false;
+        }
 
-            options.maxAge = options.maxAge || Math.round(expiry / 1000);
+        if (typeof expiry == 'number') {
+            options.expires = options.expires ?? new Date(Date.now() + expiry);
+            options.maxAge = options.maxAge ?? Math.round(expiry / 1000);
         }
 
         if (sign_cookie && typeof options.secret == 'string') {
-            options.encode = false; // Turn off encoding to prevent loss of signature structure
-            value = signature.sign(value, options.secret);
+            value = signature.sign(String(value), options.secret);
+            options.encode = String; // Preserve the signature separator and base64 characters
         }
+        delete options.secret;
 
-        if (this._cookies == undefined) this._cookies = {};
+        if (this._cookies == undefined) this._cookies = Object.create(null);
 
-        this._cookies[name] = cookie.serialize(name, value, options);
+        // Same-name cookies only replace an existing cookie with the same domain/path scope.
+        const scope = `${name}\0${String(options.domain || '').toLowerCase()}\0${options.path || ''}`;
+        this._cookies[scope] = cookie.serialize(name, value, options);
         return this;
     }
 
@@ -258,9 +372,15 @@ class Response {
     upgrade(context) {
         if (this.completed) return;
 
+        if (
+            context !== undefined &&
+            (context === null || typeof context !== 'object' || Array.isArray(context))
+        )
+            throw new TypeError('HyperExpress.Response.upgrade(context) requires an object context.');
+
         // Only requests created by an upgrade route carry the required native socket context
         if (this._upgrade_socket == null)
-            this.throw(
+            return this.throw(
                 new Error(
                     'HyperExpress: You cannot upgrade a request that does not come from an upgrade handler. No upgrade socket was found.'
                 )
@@ -276,9 +396,18 @@ class Response {
         }
 
         const headers = this._wrapped_request.headers;
+        const remote_ip =
+            this._wrapped_request._socket_ip ??
+            array_buffer_to_string(this._raw_response.getRemoteAddressAsText());
+        const remote_port =
+            this._wrapped_request._socket_port ?? this._raw_response.getRemotePort();
         this._raw_response.upgrade(
             {
                 context,
+                // uWS may lose its cached peer address while replacing HttpResponseData with
+                // WebSocketData. Capture stable connection metadata before that native upgrade.
+                remote_ip,
+                remote_port,
             },
             headers['sec-websocket-key'],
             headers['sec-websocket-protocol'],
@@ -286,8 +415,8 @@ class Response {
             this._upgrade_socket
         );
 
-        this.completed = true;
-        this.route.app._resolve_pending_request();
+        this._complete_response({ emit_finish: false, emit_close: false });
+        return this;
     }
 
     /**
@@ -301,15 +430,55 @@ class Response {
         // Allow final status, header and cookie mutations before locking response metadata
         if (this._writable) this.emit('prepare', this._wrapped_request, this);
 
+        // Compatibility setters and prepare listeners can bypass the public helpers. Revalidate
+        // every value immediately before any bytes or metadata cross into the native response.
+        if (
+            this._status_code !== undefined &&
+            (!Number.isInteger(this._status_code) ||
+                this._status_code < 100 ||
+                this._status_code > 999)
+        )
+            throw new RangeError(
+                'HyperExpress.Response statusCode must be an integer from 100 to 999.'
+            );
+        if (
+            this._status_message !== undefined &&
+            (typeof this._status_message !== 'string' || /\r|\n/.test(this._status_message))
+        )
+            throw new TypeError(
+                'HyperExpress.Response statusMessage must be a string without CR or LF characters.'
+            );
+
+        for (const name in this._headers) {
+            validate_header_name(name);
+            validate_header_values(this._headers[name]);
+
+            if (name === 'content-length') {
+                const configured = this._headers[name];
+                const value = Array.isArray(configured)
+                    ? configured[configured.length - 1]
+                    : configured;
+                const numeric = Number(value);
+                if (!/^\d+$/.test(value) || !Number.isSafeInteger(numeric) || numeric < 0)
+                    throw new RangeError(
+                        'HyperExpress.Response content-length must be a non-negative safe integer.'
+                    );
+            }
+        }
+        if (this._cookies) {
+            for (const name in this._cookies) validate_header_values(this._cookies[name]);
+        }
+
         this.initiated = true;
 
         // Resume any body pause so uWS can finish receiving the request
         this._wrapped_request.resume();
 
-        if (this._status_code || this._status_message)
-            this._raw_response.writeStatus(
-                this._status_code + ' ' + (this._status_message || status_codes[this._status_code])
-            );
+        if (this._status_code !== undefined || this._status_message !== undefined) {
+            const code = this._status_code ?? 200;
+            const message = this._status_message ?? status_codes[code] ?? '';
+            this._raw_response.writeStatus(message ? `${code} ${message}` : String(code));
+        }
 
         for (const name in this._headers) {
             // Content-Length is deferred until send() determines body-suppression semantics
@@ -344,6 +513,16 @@ class Response {
      * @param {function(number):boolean} handler Synchronous callback only
      */
     drain(handler) {
+        if (this.completed) return this;
+        if (typeof handler !== 'function') {
+            this.throw(
+                new TypeError(
+                    'HyperExpress: Response.drain(handler) -> handler must be a function.'
+                )
+            );
+            return this;
+        }
+
         // Bind one native writable callback while allowing the active drain handler to change
         const is_first_time = this._drain_handler === null;
 
@@ -351,18 +530,44 @@ class Response {
 
         if (is_first_time)
             this._raw_response.onWritable((offset) => {
-                const output = this._drain_handler(offset);
+                try {
+                    // A removed or completed handler has no pending native write to retry.
+                    if (this.completed || typeof this._drain_handler !== 'function') return true;
 
-                // uWS requires a Boolean indicating whether writable callbacks should stop
-                if (typeof output !== 'boolean')
+                    const output = this._drain_handler(offset);
+                    if (typeof output === 'boolean') return output;
+
                     this.throw(
                         new Error(
                             'HyperExpress: Response.drain(handler) -> handler must return a boolean value stating if the write was successful or not.'
                         )
                     );
-
-                return output;
+                    return true;
+                } catch (error) {
+                    this.throw(error);
+                    return true;
+                }
             });
+
+        return this;
+    }
+
+    /**
+     * Begins chunked response writing and flushes the current status and headers immediately.
+     * @returns {Response} Response (Chainable)
+     */
+    begin_write() {
+        if (!this.completed) {
+            if (this._cork && !this._corked) {
+                this._corked = true;
+                return this.atomic(() => this.begin_write());
+            }
+
+            this._streaming = true;
+            this._initiate_response();
+            this._raw_response.beginWrite();
+        }
+        return this;
     }
 
     /**
@@ -385,11 +590,7 @@ class Response {
         }
 
         if (!this.completed) {
-            // A Node writable finishes by sending the final empty response chunk
-            if (!this._streaming) {
-                this._streaming = true;
-                this.once('finish', () => this.send());
-            }
+            this._streaming = true;
 
             this._stream_chunk(chunk).then(callback).catch(callback);
         } else {
@@ -429,9 +630,23 @@ class Response {
      */
     send(body, close_connection) {
         if (!this.completed) {
+            // Finish the Node writable through its _final hook so finish always precedes close.
+            if (
+                this._writable &&
+                this._streaming &&
+                !this._finalizing_writable &&
+                !this._writable.writableEnded
+            ) {
+                if (body instanceof ArrayBuffer) body = Buffer.from(body);
+                else if (ArrayBuffer.isView(body) && !Buffer.isBuffer(body))
+                    body = Buffer.from(body.buffer, body.byteOffset, body.byteLength);
+                this._writable.end(body);
+                return this;
+            }
+
             // Queue send() behind pending writable data so body order remains deterministic
             if (this._writable && this._writable.writableLength) {
-                if (body) this._writable.write(body);
+                if (body !== undefined) this._writable.write(body);
                 this._writable.end();
                 return this;
             }
@@ -442,22 +657,50 @@ class Response {
                 return this.atomic(() => this.send(body, close_connection));
             }
 
+            const custom_length = this._headers['content-length'];
+            const content_length = Array.isArray(custom_length)
+                ? custom_length[custom_length.length - 1]
+                : custom_length;
+            if (content_length !== undefined) {
+                const numeric_length = Number(content_length);
+                if (
+                    (typeof content_length === 'string' && !/^\d+$/.test(content_length)) ||
+                    !Number.isSafeInteger(numeric_length) ||
+                    numeric_length < 0
+                ) {
+                    delete this._headers['content-length'];
+                    return this.throw(
+                        new RangeError(
+                            'HyperExpress.Response content-length must be a non-negative safe integer.'
+                        )
+                    );
+                }
+            }
+
             this._initiate_response();
+
+            // prepare listeners may have changed the deferred content-length header.
+            const prepared_custom_length = this._headers['content-length'];
+            const prepared_content_length = Array.isArray(prepared_custom_length)
+                ? prepared_custom_length[prepared_custom_length.length - 1]
+                : prepared_custom_length;
 
             if (!this._wrapped_request.received) {
                 // uWS must finish receiving the request body before the response can be sent safely
                 this._wrapped_request._body_parser_stop();
 
-                return this._wrapped_request.once('received', () =>
-                    // The received event is asynchronous, so re-enter through cork
-                    this.atomic(() => this.send(body, close_connection))
-                );
+                if (!this._deferred_send) {
+                    this._deferred_send = { body, close_connection };
+                    this._wrapped_request.once('received', () => {
+                        const deferred = this._deferred_send;
+                        this._deferred_send = undefined;
+                        if (deferred && !this.completed)
+                            this.atomic(() => this.send(deferred.body, deferred.close_connection));
+                    });
+                }
+                return this;
             }
 
-            const custom_length = this._headers['content-length'];
-            const content_length = Array.isArray(custom_length)
-                ? custom_length[custom_length.length - 1]
-                : custom_length;
             const status_code = this._status_code || 200;
             const is_head = this._wrapped_request.method === 'HEAD';
             const status_forbids_body =
@@ -466,26 +709,36 @@ class Response {
             // HEAD and specific status codes must never include response body bytes
             if (is_head || status_forbids_body) {
                 let reported_length;
-                if (content_length !== undefined && (is_head || status_code === 304)) {
-                    reported_length = Number(content_length);
+                if (prepared_content_length !== undefined && (is_head || status_code === 304)) {
+                    reported_length = Number(prepared_content_length);
                 } else if (is_head && body !== undefined) {
                     reported_length = Buffer.byteLength(body);
                 }
-                this._raw_response.endWithoutBody(reported_length, close_connection);
+                // Preserve the native optional-argument distinction. Passing explicit
+                // undefined values is coerced to a zero length by some uWS binaries,
+                // which would incorrectly add Content-Length: 0 to 204 responses.
+                if (reported_length === undefined && close_connection === undefined) {
+                    this._raw_response.endWithoutBody();
+                } else {
+                    this._raw_response.endWithoutBody(reported_length, close_connection);
+                }
 
                 // Preserve an explicitly declared length when no body bytes are supplied
-            } else if (body === undefined && !this._streaming && content_length !== undefined) {
-                this._raw_response.endWithoutBody(Number(content_length), close_connection);
+            } else if (
+                body === undefined &&
+                !this._streaming &&
+                prepared_content_length !== undefined
+            ) {
+                this._raw_response.endWithoutBody(Number(prepared_content_length), close_connection);
             } else {
                 this._raw_response.end(body, close_connection);
             }
 
-            if (this._writable && !this._streaming) this.emit('finish', this._wrapped_request, this);
-
-            this.completed = true;
-            this.route.app._resolve_pending_request();
-
-            if (this._writable) this.emit('close', this._wrapped_request, this);
+            if (this._finalizing_writable) {
+                this._complete_response({ emit_finish: false, emit_close: false });
+            } else {
+                this._complete_response();
+            }
         }
 
         return this;
@@ -504,7 +757,7 @@ class Response {
     _uws_write_chunk(chunk, total_size) {
         // Known-size streams use tryEnd; unbounded streams use chunked write
         let sent, finished;
-        if (total_size) {
+        if (total_size !== undefined) {
             const [ok, done] = this._raw_response.tryEnd(chunk, total_size);
             sent = ok;
             finished = done;
@@ -530,38 +783,68 @@ class Response {
     _stream_chunk(chunk, total_size) {
         if (this.completed) return Promise.resolve();
 
-        return new Promise((resolve) =>
+        if (typeof chunk === 'string') chunk = Buffer.from(chunk);
+        else if (chunk instanceof ArrayBuffer) chunk = Buffer.from(chunk);
+        else if (ArrayBuffer.isView(chunk) && !Buffer.isBuffer(chunk))
+            chunk = Buffer.from(chunk.buffer, chunk.byteOffset, chunk.byteLength);
+
+        return new Promise((resolve, reject) => {
+            let settled = false;
+            const on_close = () => settle();
+            const settle = (error) => {
+                if (settled) return;
+                settled = true;
+                this.removeListener('close', on_close);
+                if (error) reject(error);
+                else resolve();
+            };
+
+            this.once('close', on_close);
+
             this.atomic(() => {
-                // Recheck connection state after entering the corked uWS callback
-                if (this.completed) return resolve();
+                try {
+                    if (this.completed) return settle();
 
-                // Ensure status and headers precede the first streamed body chunk
-                this._initiate_response();
+                    this._initiate_response();
 
-                // Anchor future writable offsets to this chunk's initial response offset
-                const write_offset = this.write_offset;
-                const [sent] = this._uws_write_chunk(chunk, total_size);
-                if (sent) {
-                    resolve();
-                } else {
-                    // Retry known-size chunks across as many drain callbacks as uWS requires
+                    // getWriteOffset is the body offset before this chunk's first tryEnd call.
+                    const write_offset = this.write_offset;
+                    const [sent, finished] = this._uws_write_chunk(chunk, total_size);
+                    if (finished) {
+                        this._complete_response();
+                        return settle();
+                    }
+                    if (sent) return settle();
+
                     this.drain((offset) => {
-                        // Chunked write already owns its buffer; only tryEnd requires resending a remainder
-                        if (this.completed || !total_size) {
-                            resolve();
+                        try {
+                            if (this.completed) {
+                                settle();
+                                return true;
+                            }
+
+                            // Chunked write owns its buffer already; its callback only waits for drain.
+                            if (total_size === undefined) {
+                                settle();
+                                return true;
+                            }
+
+                            const consumed = Math.max(0, Math.min(chunk.byteLength, offset - write_offset));
+                            const remaining = chunk.subarray(consumed);
+                            const [flushed, done] = this._uws_write_chunk(remaining, total_size);
+                            if (done) this._complete_response();
+                            if (flushed || done) settle();
+                            return flushed || done;
+                        } catch (error) {
+                            settle(error);
                             return true;
                         }
-
-                        const remaining = chunk.slice(offset - write_offset);
-                        const [flushed] = this._uws_write_chunk(remaining, total_size);
-                        if (flushed) resolve();
-
-                        // false keeps the native writable callback active for another drain
-                        return flushed;
                     });
+                } catch (error) {
+                    settle(error);
                 }
-            })
-        );
+            });
+        });
     }
 
     /**
@@ -574,45 +857,75 @@ class Response {
      * @returns {Promise} a Promise which resolves once the stream has been fully consumed and response has been sent
      */
     async stream(readable, total_size) {
-        if (!(readable instanceof stream.Readable))
-            this.throw(
-                new Error('HyperExpress: Response.stream(readable, total_size) -> readable must be a Readable stream.')
+        if (!(readable instanceof stream.Readable)) {
+            const error = new TypeError(
+                'HyperExpress: Response.stream(readable, total_size) -> readable must be a Readable stream.'
             );
+            this.throw(error);
+            throw error;
+        }
+        if (
+            total_size !== undefined &&
+            (!Number.isSafeInteger(total_size) || total_size < 0)
+        ) {
+            const error = new RangeError(
+                'HyperExpress: Response.stream(readable, total_size) -> total_size must be a non-negative safe integer.'
+            );
+            this.throw(error);
+            throw error;
+        }
+        if (this.completed) return this;
 
-        if (!this.completed) {
-            // Stop consuming the source when the client closes the response
-            this.once('close', () => (!readable.destroyed ? readable.destroy() : null));
+        // Closing or completing the response must always settle the source side as well.
+        this.once('close', () => {
+            if (!readable.destroyed) readable.destroy();
+        });
 
-            // Consume one chunk at a time so each write can honor uWS backpressure
-            while (!this.completed && !(readable.readableEnded || readable.destroyed)) {
-                let chunk = readable.read();
-                if (!chunk) {
-                    // Wait for either more data or stream completion without leaving a stale end listener
-                    await new Promise((resolve) => {
-                        readable.once('end', resolve);
-
-                        readable.once('readable', () => {
-                            readable.removeListener('end', resolve);
-                            resolve();
-                        });
-                    });
-
-                    chunk = readable.read();
-                }
-
-                if (chunk) await this._stream_chunk(chunk, total_size);
+        try {
+            if (total_size === 0) {
+                this._initiate_response();
+                this._raw_response.endWithoutBody(0);
+                this._complete_response();
+                return this;
             }
 
-            // Complete lifecycle accounting according to the uWS write mode
+            let streamed_bytes = 0;
+            for await (let chunk of readable) {
+                if (this.completed) break;
+                if (typeof chunk === 'string') chunk = Buffer.from(chunk);
+                else if (chunk instanceof ArrayBuffer) chunk = Buffer.from(chunk);
+                else if (ArrayBuffer.isView(chunk) && !Buffer.isBuffer(chunk))
+                    chunk = Buffer.from(chunk.buffer, chunk.byteOffset, chunk.byteLength);
+
+                streamed_bytes += chunk.byteLength;
+                if (total_size !== undefined && streamed_bytes > total_size)
+                    throw new Error(
+                        `HyperExpress: Response stream exceeded its declared ${total_size} byte size.`
+                    );
+
+                await this._stream_chunk(chunk, total_size);
+            }
+
             if (!this.completed) {
-                if (total_size) {
-                    // tryEnd closes natively, so no conventional send() call resolves the pending request
-                    this.route.app._resolve_pending_request();
+                if (total_size !== undefined) {
+                    if (streamed_bytes === total_size)
+                        await this._stream_chunk(Buffer.alloc(0), total_size);
+
+                    if (!this.completed)
+                        throw new Error(
+                            `HyperExpress: Response stream closed after ${streamed_bytes} of ${total_size} declared bytes.`
+                        );
                 } else {
-                    // Chunked writes remain open until send() emits the terminating response chunk
                     this.send();
                 }
             }
+            return this;
+        } catch (error) {
+            // Completion intentionally destroys the source and may surface as premature close
+            // from the async iterator even though the native response finished successfully.
+            if (this.completed) return this;
+            if (!this.completed) this.close();
+            throw error;
         }
     }
 
@@ -622,17 +935,12 @@ class Response {
      */
     close() {
         if (!this.completed) {
-            this.completed = true;
-
-            this.route.app._resolve_pending_request();
-
-            this._wrapped_request._body_parser_stop();
-
-            // Resume input so a body-parser or backpressure pause does not outlive closure
-            this._wrapped_request.resume();
-
+            const error = new Error('HyperExpress: Request was closed before its lifecycle completed.');
+            error.code = 'ERR_REQUEST_CLOSED';
+            this._complete_response({ error, emit_finish: false });
             this._raw_response.close();
         }
+        return this;
     }
 
     /**
@@ -653,7 +961,9 @@ class Response {
      * @returns {Response} Response (Chainable)
      */
     json(body) {
-        return this.header('content-type', 'application/json', true).send(JSON.stringify(body));
+        return this.header('content-type', 'application/json; charset=utf-8', true).send(
+            JSON.stringify(body)
+        );
     }
 
     /**
@@ -666,9 +976,24 @@ class Response {
      * @returns {Response} Response (Chainable)
      */
     jsonp(body, name) {
-        let query_parameters = this._wrapped_request.query_parameters;
-        let method_name = query_parameters['callback'] || name;
-        return this.header('content-type', 'application/javascript', true).send(`${method_name}(${JSON.stringify(body)})`);
+        const query_parameters = this._wrapped_request.query_parameters;
+        const callback = query_parameters['callback'] ?? name;
+
+        // Only JavaScript identifier paths are valid callbacks. Invalid or absent callback
+        // values fall back to regular JSON instead of becoming executable source text.
+        if (
+            typeof callback !== 'string' ||
+            !/^[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*$/.test(callback)
+        )
+            return this.json(body);
+
+        const payload = JSON.stringify(body)
+            .replace(/</g, '\\u003c')
+            .replace(/\u2028/g, '\\u2028')
+            .replace(/\u2029/g, '\\u2029');
+        return this.header('content-type', 'application/javascript; charset=utf-8', true).send(
+            `${callback}(${payload})`
+        );
     }
 
     /**
@@ -679,7 +1004,7 @@ class Response {
      * @returns {Response} Response (Chainable)
      */
     html(body) {
-        return this.header('content-type', 'text/html', true).send(body);
+        return this.header('content-type', 'text/html; charset=utf-8', true).send(body);
     }
 
     /**
@@ -697,8 +1022,8 @@ class Response {
 
         this.send(live_file.buffer);
 
-        // Expose the cache asynchronously so callers can expire entries after the response
-        if (callback) setImmediate(() => callback(FilePool));
+        // Expose the server-owned cache asynchronously so callers can expire entries.
+        if (callback) setImmediate(() => callback(this.app._file_pool));
 
         return this;
     }
@@ -714,16 +1039,19 @@ class Response {
      * @returns {Promise<Response>}
      */
     file(path, callback) {
-        if (FilePool[path]) return this._send_file(FilePool[path], callback).catch((error) => this.throw(error));
+        const cache_key = Path.resolve(path);
+        const file_pool = this.app._file_pool;
+        if (file_pool[cache_key])
+            return this._send_file(file_pool[cache_key], callback).catch((error) => this.throw(error));
 
         const live_file = new LiveFile({
-            path,
+            path: cache_key,
         });
-        FilePool[path] = live_file;
+        file_pool[cache_key] = live_file;
 
         // Remove unavailable files from cache so a future request can retry loading them
         live_file.on('error', () => {
-            if (FilePool[path] === live_file) delete FilePool[path];
+            if (file_pool[cache_key] === live_file) delete file_pool[cache_key];
         });
 
         return this._send_file(live_file, callback).catch((error) => this.throw(error));
@@ -739,11 +1067,13 @@ class Response {
     attachment(path, name) {
         if (path == undefined) return this.header('Content-Disposition', 'attachment');
 
-        let chunks = path.split('/');
-        let final_name = name || chunks[chunks.length - 1];
-        let name_chunks = final_name.split('.');
-        let extension = name_chunks[name_chunks.length - 1];
-        return this.header('content-disposition', `attachment; filename="${final_name}"`).type(extension);
+        const requested_name = name == null ? path : name;
+        const final_name = String(requested_name).split(/[\\/]/).pop();
+        const safe_name = final_name.replace(/[\u0000-\u001f\u007f"\\]/g, '_') || 'download';
+        const extension = Path.extname(safe_name).slice(1);
+        this.header('content-disposition', `attachment; filename="${safe_name}"`);
+        if (extension) this.type(extension);
+        return this;
     }
 
     /**
@@ -766,6 +1096,13 @@ class Response {
      * @returns {Response}
      */
     throw(error) {
+        // Body limit failures are lifecycle control flow, not application errors. Preserve the
+        // 413 response even when an awaiting route parser observes the rejected body promise.
+        if (error instanceof Error && error.code === 'ERR_BODY_LIMIT') {
+            if (!this.completed) this.status(413).send();
+            return this;
+        }
+
         // Only the first lifecycle error reaches the global handler
         if (this.#thrown) return this;
         this.#thrown = true;
@@ -773,7 +1110,7 @@ class Response {
         // Normalize non-Error throws for a consistent handler contract
         if (!(error instanceof Error)) error = new Error(`ERR_CAUGHT_NON_ERROR_TYPE: ${error}`);
 
-        this.route.app.handlers.on_error(this._wrapped_request, this, error);
+        this.route.handle_error(this._wrapped_request, this, error);
         return this;
     }
 
@@ -887,10 +1224,56 @@ inherit_prototype({
             // Create the Node writable only when an inherited stream API is first used
             if (this._writable === null) {
                 this._writable = new stream.Writable(this.route.streaming.writable);
+                this._piped_sources = new Map();
 
                 // Preserve the Response lifecycle as the native write implementation context
                 this._writable._write = descriptors['_write'].value.bind(this);
                 this._writable._writev = descriptors['_writev'].value.bind(this);
+                this._writable._final = (callback) => {
+                    this._finalizing_writable = true;
+                    try {
+                        this.send();
+                        callback();
+                    } catch (error) {
+                        callback(error);
+                    } finally {
+                        this._finalizing_writable = false;
+                    }
+                };
+
+                // Node's pipe() unpipes a source when its destination closes, but does not destroy
+                // the source. Track piped sources so aborted responses cannot leak file handles or
+                // leave producers paused forever. Source failures are contained by the route handler.
+                this._writable.on('pipe', (source) => {
+                    const on_error = (error) => {
+                        this._piped_sources.delete(source);
+                        if (!this.completed) {
+                            this.throw(error);
+                            if (!this.completed) this.close();
+                        }
+                    };
+                    this._piped_sources.set(source, on_error);
+                    source.once('error', on_error);
+                });
+                this._writable.on('unpipe', (source) => {
+                    const on_error = this._piped_sources.get(source);
+                    if (on_error) source.removeListener('error', on_error);
+                    this._piped_sources.delete(source);
+                });
+
+                // Node emits finish and then close after _final's callback. Internal listeners
+                // only mirror state; user listeners receive the native Writable ordering once.
+                this._writable.once('finish', () => {
+                    this._finish_emitted = true;
+                });
+                this._writable.once('close', () => {
+                    this._close_emitted = true;
+                    for (const [source, on_error] of this._piped_sources) {
+                        source.removeListener('error', on_error);
+                        if (!source.destroyed) source.destroy();
+                    }
+                    this._piped_sources.clear();
+                });
             }
 
             return original.apply(this._writable, arguments);

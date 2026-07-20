@@ -18,6 +18,10 @@ Below is a breakdown of the `Request` component which is an extended `Readable` 
 | `query_parameters` | `Object`  | Query parameters from incoming request. |
 | `ip` | `String`  | Remote connection IP. |
 | `proxy_ip` | `String`  | Remote proxy connection IP. |
+| `port` | `Number`  | Remote connection port. |
+| `proxy_port` | `Number`  | Remote proxy connection port. |
+
+Connection addresses and ports are captured while the native `uWS.HttpResponse` is valid. They remain stable and readable after the HTTP response ends and are transferred into an upgraded WebSocket before uWebSockets.js replaces its HTTP socket data.
 
 #### Request Methods
 * `sign(String: string, String: secret)`: Signs provided string with provided secret.
@@ -32,25 +36,28 @@ Below is a breakdown of the `Request` component which is an extended `Readable` 
     * **Returns** `Promise` which is then resolved to an `Object`.
 * `json(Any: default_value)`: Parses body as a JSON Object from incoming request.
     * **Returns** `Promise` which is then resolved to an `Object` or `typeof default_value`.
-    * **Note** this method returns the specified `default_value` if JSON parsing fails instead of throwing an exception. To have this method throw an exception, pass `undefined` for `default_value`.
+    * **Note** this method returns the specified `default_value` if JSON parsing fails instead of throwing an exception. To have this method throw an exception, pass `null` for `default_value`.
     * **Note** `default_value` is `{}` by default meaning `json()` is a safe method even if incoming body is invalid json.
+* Body helpers share one retained raw body. Concurrent calls to the same helper share an in-flight Promise; after success, any helper may be called repeatedly and resolves from its value cache, including empty or falsey results.
+* Request remains a lazy Node.js `Readable`: applications may consume the upload through `pipe()`/stream methods instead of body helpers. Native intake is paused at the configured buffering/high-water limits and resumed by Readable demand; native `resume()` is never called after body completion.
+* Exceptions thrown synchronously by `Readable` consumers during native body delivery are routed through the scoped HyperExpress error handler and never escape through a native uWebSockets.js body callback.
 * `multipart(...2 Overloads)`: Parses incoming multipart form based requests allowing for file uploads.
     * **Returns** a `Promise` which is **resolved** once **all** of the fields have been processed.
-        * **Note** you may provide an async `handler` to ensure all fields get executed after each `handler` invocaton has finished.
-        * **Note** the returnd `Promise` can **reject** with one of the `String` constants below or an uncaught `Error` object.
+        * **Note** the handler may return any thenable. Fields are processed through one serialized queue and the returned Promise waits for every field/file handler.
+        * **Note** the returned `Promise` can **reject** with one of the `String` constants below or an uncaught `Error` object.
             * `PARTS_LIMIT_REACHED`: This error is rejected when the configured Busboy `limits.parts` limit has been reached.
             * `FILES_LIMIT_REACHED`: This error is rejected when the configured Busboy `limits.files` limit has been reached.
             * `FIELDS_LIMIT_REACHED`: This error is rejected when the configured Busboy `limits.fields` limit has been reached.
     * **Overload Types**:
       * `multipart(Function: handler)`: Parses the incoming multipart request with the default Busboy `options` through the specified `handler`.
-      * `multipart(BusboyConfig: options, Function: handler)`: Parses the incoming multipart request with the spcified `options` through the specified `handler`.
+      * `multipart(BusboyConfig: options, Function: handler)`: Parses the incoming multipart request with the specified `options` through the specified `handler`.
       * **Handler Example**: `(field: MultipartField) => { /* Your Code Here */}`
-        * **Note** this `handler` can be either a synchronous or asynchronous function.
-        * **Note** HyperExpress will automatically pause and wait for your **async** handler to resolve on **each** field.
+        * **Note** this `handler` can be synchronous or return any thenable.
+        * **Note** HyperExpress waits for each handler and drains file streams that a handler does not consume.
       * **See** [`> [MultipartField]`](./MultipartField.md) to view all properties and methods available for each multipart field.
       * **See** [`> [Busboy]`](https://github.com/mscdex/busboy) to view all customizable `BusboyConfig` options and learn more about the Busboy multipart parser.
     * **Note** the body parser uses the global `Server.max_body_length` by default. You can **override** this property on a route by specifying a higher `max_body_length` in the route options when creating that route.
-    * **Note** HyperExpress currently **does not support** chunked transfer requests.
+    * **Note** fixed-length, empty, and transfer-encoded bodies share the same body lifecycle and limit enforcement.
 * See [ExpressJS](https://github.com/expressjs/express) documentation for more properties/methods that are also implemented for compatibility.
 
 #### Request Events

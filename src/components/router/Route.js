@@ -12,6 +12,7 @@ class Route {
     streaming = null;
     max_body_length = null;
     path_parameters_key = null;
+    error_scopes = [];
 
     /**
      * Constructs a new Route object.
@@ -21,16 +22,37 @@ class Route {
      * @param {String} options.pattern - The route pattern.
      * @param {Function} options.handler - The route handler.
      */
-    constructor({ app, method, pattern, options, handler }) {
+    constructor({ app, method, pattern, options, handler, error_scopes = [] }) {
         this.id = app._get_incremented_id();
         this.app = app;
         this.pattern = pattern;
         this.handler = handler;
-        this.options = options;
+        this.options = {
+            ...options,
+            middlewares: Array.isArray(options.middlewares) ? [...options.middlewares] : [],
+        };
         this.method = method.toUpperCase();
-        this.streaming = options.streaming || app._options.streaming || {};
-        this.max_body_length = options.max_body_length || app._options.max_body_length;
+        if (
+            Object.prototype.hasOwnProperty.call(options, 'streaming') &&
+            (options.streaming === null ||
+                typeof options.streaming !== 'object' ||
+                Array.isArray(options.streaming))
+        )
+            throw new TypeError('HyperExpress route option streaming must be an object.');
+        this.streaming = options.streaming ?? app._options.streaming ?? {};
+        this.max_body_length = options.max_body_length ?? app._options.max_body_length;
+        if (
+            this.streaming === null ||
+            typeof this.streaming !== 'object' ||
+            Array.isArray(this.streaming)
+        )
+            throw new TypeError('HyperExpress route option streaming must be an object.');
+        if (!Number.isSafeInteger(this.max_body_length) || this.max_body_length < 0)
+            throw new RangeError(
+                'HyperExpress route option max_body_length must be a non-negative safe integer.'
+            );
         this.path_parameters_key = parse_path_parameters(pattern);
+        this.error_scopes = [...error_scopes];
 
         // Translate to HTTP DELETE
         if (this.method === 'DEL') this.method = 'DELETE';
@@ -68,69 +90,154 @@ class Route {
         // Ignore lifecycle work after the response has completed
         if (response.completed) return;
 
-        let iterator;
-        const middleware = this.options.middlewares[cursor];
-        if (middleware) {
-            if (middleware.match) {
-                if (request.path.startsWith(middleware.pattern)) {
-                    // Require a path boundary so "/docs" does not match "/docs-JSON"
-                    const trailing = request.path[middleware.pattern.length];
-                    if (trailing !== '/' && trailing !== undefined) {
-                        return this.handle(request, response, cursor + 1);
-                    }
-                } else {
-                    return this.handle(request, response, cursor + 1);
-                }
-            }
+        let middleware = this.options.middlewares[cursor];
+        while (middleware && middleware.match) {
+            const pattern = middleware.pattern;
+            const matches =
+                pattern === '/' ||
+                (request.path.startsWith(pattern) &&
+                    (request.path[pattern.length] === '/' || request.path[pattern.length] === undefined));
+            if (matches) break;
 
-            // Track the middleware cursor to prevent double execution
-            response._track_middleware_cursor(cursor);
-
-            // next() forwards errors or advances to the next middleware or route handler
-            iterator = (error) => {
-                if (error instanceof Error) return response.throw(error);
-                this.handle(request, response, cursor + 1);
-            };
+            cursor++;
+            middleware = this.options.middlewares[cursor];
         }
 
-        // Await declared async handlers so thrown and rejected errors reach the response error path
-        const is_async_handler = (middleware ? middleware.handler : this.handler).constructor.name === 'AsyncFunction';
-        if (is_async_handler) {
-            new Promise(async (resolve) => {
-                try {
-                    if (middleware) {
-                        await middleware.handler(request, response, iterator);
+        if (middleware) {
+            let completed = false;
+            let duplicate_reported = false;
 
-                        // Async middleware advances automatically after it resolves
-                        iterator();
-                    } else {
-                        await this.handler(request, response);
+            // A middleware can complete through next(), fulfillment, rejection, or a throw exactly once.
+            const next = (error, force_error = false) => {
+                if (completed) {
+                    if (this.app._options.strict_middleware && !duplicate_reported) {
+                        duplicate_reported = true;
+                        this.handle_error(
+                            request,
+                            response,
+                            new Error(
+                                'ERR_DUPLICATE_MIDDLEWARE_COMPLETION: Middleware called next() or settled more than once.'
+                            )
+                        );
                     }
-                } catch (error) {
+                    return false;
+                }
+
+                completed = true;
+                if (force_error || error instanceof Error) {
                     response.throw(error);
-                }
-
-                resolve();
-            });
-        } else {
-            // Protect synchronous execution while also observing returned thenables
-            try {
-                let output;
-                if (middleware) {
-                    output = middleware.handler(request, response, iterator);
                 } else {
-                    output = this.handler(request, response);
+                    this.handle(request, response, cursor + 1);
                 }
+                return true;
+            };
 
-                if (typeof output?.then === 'function') {
-                    // Promise-returning middleware advances after resolution
-                    if (middleware) output.then(iterator);
-
-                    output.catch((error) => response.throw(error));
-                }
+            let output;
+            try {
+                output = middleware.handler(request, response, next);
             } catch (error) {
-                response.throw(error);
+                next(error, true);
+                return;
             }
+
+            let is_thenable;
+            try {
+                is_thenable = output != null && typeof output.then === 'function';
+            } catch (error) {
+                next(error, true);
+                return;
+            }
+
+            if (is_thenable) {
+                Promise.resolve(output).then(
+                    (value) => next(value, value instanceof Error),
+                    (error) => next(error, true)
+                );
+            }
+
+            return;
+        }
+
+        // Route handlers do not auto-chain, but returned thenables are observed for lifecycle errors.
+        let output;
+        try {
+            output = this.handler(request, response);
+        } catch (error) {
+            response.throw(error);
+            return;
+        }
+
+        let is_thenable;
+        try {
+            is_thenable = output != null && typeof output.then === 'function';
+        } catch (error) {
+            response.throw(error);
+            return;
+        }
+
+        if (is_thenable) {
+            Promise.resolve(output).then(
+                (value) => {
+                    if (value instanceof Error) response.throw(value);
+                },
+                (error) => response.throw(error)
+            );
+        }
+    }
+
+    /**
+     * Dispatches an error through this route's router scopes before the server handler.
+     * @private
+     */
+    handle_error(request, response, error, scopes = this.error_scopes, cursor = 0) {
+        if (!(error instanceof Error)) error = new Error(`ERR_CAUGHT_NON_ERROR_TYPE: ${error}`);
+
+        let handler;
+        while (cursor < scopes.length && !handler) {
+            handler = scopes[cursor]._get_error_handler();
+            cursor++;
+        }
+
+        const fallback = (next_error) =>
+            this.handle_error(request, response, next_error, scopes, cursor);
+
+        if (!handler) {
+            handler = this.app.handlers.on_error;
+            try {
+                const output = handler(request, response, error);
+                if (output != null && typeof output.then === 'function') {
+                    Promise.resolve(output).then(
+                        (value) => {
+                            if (value instanceof Error) {
+                                console.error(value);
+                                if (!response.completed) response.close();
+                            }
+                        },
+                        (handler_error) => {
+                            console.error(handler_error);
+                            if (!response.completed) response.close();
+                        }
+                    );
+                }
+            } catch (handler_error) {
+                console.error(handler_error);
+                if (!response.completed) response.close();
+            }
+            return;
+        }
+
+        try {
+            const output = handler(request, response, error);
+            if (output != null && typeof output.then === 'function') {
+                Promise.resolve(output).then(
+                    (value) => {
+                        if (value instanceof Error) fallback(value);
+                    },
+                    fallback
+                );
+            }
+        } catch (handler_error) {
+            fallback(handler_error);
         }
     }
 

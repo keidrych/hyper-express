@@ -40,9 +40,9 @@ webserver.use('/api/v1', api_v1_router);
     * **Middlewares**
         * **Callback Example:** `(Request: request, Response: response, Function: next) => {}`.
         * **Promise Example:** `(Request: request, Response: response) => new Promise((resolve, reject) => { /* Call resolve() in here */ })`.
-        * **Note** you must ensure that each middleware iterates by executing the `next` callback or resolving the returned `Promise`.
-        * **Note** calling `next(new Error(...))` or resolving/rejecting with an `Error` will call the global error handler.
-        * **Note** you must **NOT** call `next()` while also resovling the async promise of a middleware to prevent double iterations.
+        * **Note** synchronous middleware must call `next()` to advance. `next()` returns `true` for its accepted first call and `false` for later calls.
+        * **Note** any returned thenable advances when fulfilled. Calling `next(error)`, throwing, rejecting, or fulfilling with an `Error` invokes the applicable scoped error handler.
+        * **Note** each middleware advances at most once. Later `next()` calls and thenable settlements are ignored; `strict_middleware: true` additionally reports duplicate completion as an error.
     * **Note** `pattern` is treated as a wildcard match by default and does not support `*`/`:param` prefixes.
         * **Example:** A `GET /users/:id` route from a `Router` used with `use('/api/v1', router)` call will be created as `GET /api/v1/users/:id`.
         * **Example:** A middleware assigned directly to a `Router` used with `use('/api', router)` will execute for all routes that begin with `/api`.
@@ -69,24 +69,34 @@ webserver.use('/api/v1', api_v1_router);
     * **Supports** both synchronous and asynchronous route `handler` functions.
     * **Supports** path parameters with `:param` prefix.
         * **Example:** `/api/v1/users/:action/:id` will populate `Request.path_parameters` with `id` value from path.
+* `set_error_handler(Function: handler)`: Binds a scoped error handler and returns the current `Router`.
+    * Route errors use the innermost mounted router handler, then parent routers, then the server handler.
+    * Handlers may be assigned before or after mounting, including when the same router is mounted more than once.
+* `set_not_found_handler(Function: handler)`: Binds a scoped not-found handler and returns the current `Router`.
+    * An unmatched request uses the longest matching router mount boundary. Equal boundaries use first-mount order, then fall back through parents to the server.
 * `ws(String: pattern, Object: options, Function: handler)`: Creates a **websocket** listening route allowing for websocket connections.
     * **Example Handler**: `(Websocket: ws) => { /* A websocket connection has opened */ }`
     * **Parameter** `options`[`Object`]: This parameter is **optional** thus you can simply provide a `pattern` and `handler` for simpler code.
         * `idle_timeout`[`Number`]: Number of **seconds** after which a websocket connection will be disconnected after inactivity.
             * **Default**: `32`
-            * **Note** this number must be a factor of 4 meaning `idle_timeout % 4 == 0` due to a uWebsockets requirement.
+            * **Valid range**: `0` to disable, or an integer from `8` through `960`. Values outside this range are rejected before uWebSockets.js, whose C++ core terminates the process for unsupported values.
         * `message_type`[`String`]: Data type in which to process and emit messages from connections.
             * **Default**: `String`
-            * **Must be one of** `String`, `Buffer`, `ArrayBuffer`
-            * **Note** `ArrayBuffer` is directly passed from uWebsockets handler thus it is only memory allocated for a synchronous operation.
+            * **Must be one of** `String`, `Buffer`, `ArrayBuffer`, `ArrayBufferSafe`
+            * **Note** `ArrayBuffer` preserves the v6 zero-copy behavior and is volatile after the synchronous event callback returns. Use `ArrayBufferSafe` when the message must be retained asynchronously. `Buffer` is also safe to retain.
         * `compression`[`Number`]: Defines the type of per message deflate compression to use.
             * **Default**: `HyperExpress.compressors.DISABLED`
-            * Please provide one of the constants from `require('hyper-express').compressors`.
+            * Provide a valid compressor/decompressor preset from `require('hyper-express').compressors`. A compressor and decompressor may be combined with bitwise OR.
                 * `DISABLED`, `SHARED_COMPRESSOR`, `DEDICATED_COMPRESSOR_3KB`, `DEDICATED_COMPRESSOR_4KB`, `DEDICATED_COMPRESSOR_8KB`, `DEDICATED_COMPRESSOR_16KB`, `DEDICATED_COMPRESSOR_32KB`, `DEDICATED_COMPRESSOR_64KB`, `DEDICATED_COMPRESSOR_128KB`, `DEDICATED_COMPRESSOR_256KB`
         * `max_backpressure`[`Number`]: Maximum length of allowed backpressure per connection when publishing or sending messages.
             * **Default**: `1024 * 1024` > `1,048,576`
+            * **Valid range**: integer bytes from `0` through `2,147,483,647`.
             * **Note** slow receivers with too high backpressure will be skipped and timeout until they catch up.
         * `max_payload_length`[`Number`]: Maximum length of allowed incoming messages per connection.
             * **Default**: `32 * 1024` > `32,768`
+            * **Valid range**: integer bytes from `0` through `2,147,483,647`.
             * **Note** any connection that sends a message larger than this number will be immediately closed.
+        * `close_on_backpressure_limit`[`Boolean`]: Opt-in. Closes a connection when `max_backpressure` is reached instead of dropping the message. When omitted, the native default remains unchanged.
+        * `max_lifetime`[`Number`]: Opt-in maximum connection lifetime in minutes. Use `0` to disable this limit; otherwise use an integer from `1` through `239`. When omitted, HyperExpress does not impose a lifetime.
+        * `send_pings_automatically`[`Boolean`]: Opt-in control for automatic uWebSockets.js ping frames. When omitted, the native default remains unchanged.
     * **See** [`> [Websocket]`](./Websocket.md) for usage documentation on this method and working with websockets.

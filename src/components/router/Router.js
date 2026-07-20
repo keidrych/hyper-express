@@ -1,6 +1,18 @@
 'use strict';
 const { merge_relative_paths } = require('../../shared/operators.js');
 
+function normalize_mount_pattern(pattern) {
+    if (pattern.length > 1 && pattern.endsWith('/')) return pattern.slice(0, -1);
+    return pattern;
+}
+
+function clone_route_options(options) {
+    return {
+        ...options,
+        middlewares: Array.isArray(options.middlewares) ? [...options.middlewares] : [],
+    };
+}
+
 /**
  * @typedef {import('../compatibility/NodeRequest.js')} NodeRequest
  * @typedef {import('../compatibility/NodeResponse.js').NodeResponseTypes} NodeResponse
@@ -17,9 +29,14 @@ class Router {
     #is_app = false;
     #context_pattern;
     #subscribers = [];
+    #handlers = {
+        on_error: null,
+        on_not_found: null,
+    };
     #records = {
         routes: [],
         middlewares: [],
+        mounts: [],
     };
 
     constructor() {}
@@ -45,6 +62,16 @@ class Router {
         this.#context_pattern = path;
     }
 
+    /** @private */
+    _get_error_handler() {
+        return this.#handlers.on_error;
+    }
+
+    /** @private */
+    _get_not_found_handler() {
+        return this.#handlers.on_not_found;
+    }
+
     /**
      * Registers a route in the routes array for this router.
      *
@@ -60,6 +87,7 @@ class Router {
 
         // Normalize route overloads into a pattern, options object and ordered callbacks
         let pattern, options, handler;
+        let options_count = 0;
 
         const callbacks = [];
         for (let argument_index = 1; argument_index < arguments.length; argument_index++) {
@@ -87,14 +115,32 @@ class Router {
             if (typeof argument == 'function') {
                 callbacks.push(argument);
             } else if (Array.isArray(argument)) {
+                for (const candidate of argument) {
+                    if (typeof candidate !== 'function')
+                        throw new TypeError(
+                            'HyperExpress.Router: Route middleware arrays may only contain functions.'
+                        );
+                }
                 callbacks.push(...argument);
             } else if (argument && typeof argument == 'object') {
+                options_count++;
+                if (options_count > 1)
+                    throw new TypeError(
+                        'HyperExpress.Router: A route may only specify one options object.'
+                    );
                 options = argument;
+            } else {
+                throw new TypeError(
+                    'HyperExpress.Router: Route arguments must be a pattern, options object, function, or middleware array.'
+                );
             }
         }
 
         // The final callback handles the route while preceding callbacks act as middleware
         handler = callbacks.pop();
+        if (typeof handler !== 'function')
+            throw new TypeError('HyperExpress.Router: A route handler function is required.');
+
         options = {
             streaming: {},
             middlewares: [],
@@ -104,13 +150,27 @@ class Router {
         // Make a shallow copy of the options object to avoid mutating the original
         options = Object.assign({}, options);
 
+        if (!pattern.length || pattern.includes('\0'))
+            throw new TypeError(
+                'HyperExpress.Router: Route patterns must be non-empty strings without null bytes.'
+            );
+
         // uWS requires catch-all patterns to begin with a slash
         if (pattern.startsWith('*')) pattern = '/' + pattern;
 
         // Merge configured and positional middleware without mutating caller-owned arrays
         const middlewares = [];
 
-        if (Array.isArray(options.middlewares)) middlewares.push(...options.middlewares);
+        if (!Array.isArray(options.middlewares))
+            throw new TypeError('HyperExpress.Router: options.middlewares must be an array of functions.');
+
+        for (const middleware of options.middlewares) {
+            if (typeof middleware !== 'function')
+                throw new TypeError(
+                    'HyperExpress.Router: options.middlewares may only contain functions.'
+                );
+            middlewares.push(middleware);
+        }
 
         if (callbacks.length > 0) middlewares.push(...callbacks);
 
@@ -121,6 +181,22 @@ class Router {
             pattern,
             options,
             handler,
+            error_scopes: this.#is_app ? [] : [this],
+        };
+
+        return this._register_route_record(record);
+    }
+
+    /**
+     * Stores and propagates an already-normalized route record.
+     * @private
+     * @param {Object} record
+     */
+    _register_route_record(record) {
+        record = {
+            ...record,
+            options: clone_route_options(record.options),
+            error_scopes: [...(record.error_scopes || [])],
         };
 
         // Store record for future subscribers
@@ -147,7 +223,7 @@ class Router {
      */
     _register_middleware(pattern, middleware) {
         const record = {
-            pattern: pattern.endsWith('/') ? pattern.slice(0, -1) : pattern, // Normalize middleware path boundaries
+            pattern: normalize_mount_pattern(pattern),
             middleware,
         };
 
@@ -162,6 +238,30 @@ class Router {
         for (const subscriber of subscribers) {
             subscriber('middleware', record);
         }
+
+        return this;
+    }
+
+    /**
+     * Stores a mounted router boundary used for scoped not-found handling.
+     * @private
+     * @param {Object} record
+     */
+    _register_mount(record) {
+        record = {
+            pattern: normalize_mount_pattern(record.pattern),
+            scopes: [...record.scopes],
+        };
+
+        this.#records.mounts.push(record);
+
+        if (this.#is_app) return this._create_router_mount(record);
+
+        for (const subscriber of this.#subscribers) {
+            subscriber('mount', record);
+        }
+
+        return this;
     }
 
     /**
@@ -173,19 +273,28 @@ class Router {
      */
     _register_router(pattern, router) {
         const reference = this;
+        const parent_scopes = this.#is_app ? [] : [this];
+        const mount_pattern = router.#context_pattern
+            ? merge_relative_paths(pattern, router.#context_pattern)
+            : pattern;
+
+        this._register_mount({
+            pattern: mount_pattern,
+            scopes: [router, ...parent_scopes],
+        });
+
         router._subscribe((event, object) => {
             switch (event) {
                 case 'records':
-                    const { routes, middlewares } = object;
+                    const { routes, middlewares, mounts } = object;
 
                     // Replay existing child routes beneath the mounted path
                     for (const route_record of routes) {
-                        reference._register_route(
-                            route_record.method,
-                            merge_relative_paths(pattern, route_record.pattern),
-                            route_record.options,
-                            route_record.handler
-                        );
+                        reference._register_route_record({
+                            ...route_record,
+                            pattern: merge_relative_paths(pattern, route_record.pattern),
+                            error_scopes: [...route_record.error_scopes, ...parent_scopes],
+                        });
                     }
 
                     // Replay existing child middleware beneath the mounted path
@@ -195,23 +304,36 @@ class Router {
                             middleware_record.middleware
                         );
                     }
+
+                    for (const mount_record of mounts) {
+                        reference._register_mount({
+                            pattern: merge_relative_paths(pattern, mount_record.pattern),
+                            scopes: [...mount_record.scopes, ...parent_scopes],
+                        });
+                    }
                     return;
                 case 'route':
                     // Register route from router locally with adjusted pattern
-                    return reference._register_route(
-                        object.method,
-                        merge_relative_paths(pattern, object.pattern),
-                        object.options,
-                        object.handler
-                    );
+                    return reference._register_route_record({
+                        ...object,
+                        pattern: merge_relative_paths(pattern, object.pattern),
+                        error_scopes: [...object.error_scopes, ...parent_scopes],
+                    });
                 case 'middleware':
                     // Register middleware from router locally with adjusted pattern
                     return reference._register_middleware(
-                        merge_relative_paths(pattern, object.patch),
+                        merge_relative_paths(pattern, object.pattern),
                         object.middleware
                     );
+                case 'mount':
+                    return reference._register_mount({
+                        pattern: merge_relative_paths(pattern, object.pattern),
+                        scopes: [...object.scopes, ...parent_scopes],
+                    });
             }
         });
+
+        return this;
     }
 
     /* Router public methods */
@@ -227,6 +349,32 @@ class Router {
         handler('records', this.#records);
 
         this.#subscribers.push(handler);
+    }
+
+    /**
+     * Sets the error handler for routes and middleware owned by this router.
+     * @param {function(NativeRequest, NativeResponse, Error):any} handler
+     * @returns {this}
+     */
+    set_error_handler(handler) {
+        if (typeof handler !== 'function')
+            throw new TypeError('HyperExpress.Router.set_error_handler(): handler must be a function.');
+
+        this.#handlers.on_error = handler;
+        return this;
+    }
+
+    /**
+     * Sets the not-found handler for requests beneath this router's mount boundary.
+     * @param {function(NativeRequest, NativeResponse):any} handler
+     * @returns {this}
+     */
+    set_not_found_handler(handler) {
+        if (typeof handler !== 'function')
+            throw new TypeError('HyperExpress.Router.set_not_found_handler(): handler must be a function.');
+
+        this.#handlers.on_not_found = handler;
+        return this;
     }
 
     /**
@@ -246,6 +394,11 @@ class Router {
         // Parse a pattern for this use call with a fallback to the local-global scope aka. '/' pattern
         const pattern = arguments[0] && typeof arguments[0] == 'string' ? arguments[0] : '/';
 
+        if (!pattern.length || pattern.includes('\0'))
+            throw new TypeError(
+                'HyperExpress.Router.use(): mount patterns must be non-empty strings without null bytes.'
+            );
+
         // Validate that the pattern value does not contain any wildcard or path parameter prefixes which are not allowed
         if (pattern.indexOf('*') > -1 || pattern.indexOf(':') > -1)
             throw new Error(
@@ -260,6 +413,12 @@ class Router {
             } else if (Array.isArray(candidate)) {
                 const middlewares = candidate;
                 for (const middleware_handler of middlewares) {
+                    if (typeof middleware_handler !== 'function')
+                        throw new TypeError(
+                            'HyperExpress.Router.use(): Middleware arrays may only contain functions.'
+                        );
+                }
+                for (const middleware_handler of middlewares) {
                     this._register_middleware(pattern, middleware_handler);
                 }
             } else if (candidate instanceof Router) {
@@ -267,6 +426,10 @@ class Router {
             } else if (candidate && typeof candidate == 'object' && typeof candidate.middleware == 'function') {
                 // Scenario: Inferred middleware for third-party middlewares which support the Middleware.middleware property
                 this._register_middleware(pattern, candidate.middleware);
+            } else if (candidate_index !== 0 || candidate !== pattern) {
+                throw new TypeError(
+                    'HyperExpress.Router.use(): Expected a middleware function, middleware array, Router, or middleware wrapper.'
+                );
             }
         }
 
@@ -290,8 +453,10 @@ class Router {
      * @returns {this} A Chainable instance with a context pattern set to this router's pattern.
      */
     route(pattern) {
-        if (!pattern || typeof pattern !== 'string')
-            throw new Error('HyperExpress.Router.route(pattern) -> pattern must be a string.');
+        if (typeof pattern !== 'string' || !pattern.length || pattern.includes('\0'))
+            throw new Error(
+                'HyperExpress.Router.route(pattern) -> pattern must be a non-empty string without null bytes.'
+            );
 
         // Bind subsequent route calls to the provided context pattern
         const router = new Router();
@@ -427,7 +592,7 @@ class Router {
 
     /**
      * @typedef {Object} WSRouteOptions
-     * @property {('String'|'Buffer'|'ArrayBuffer')} message_type Specifies data type in which to provide incoming websocket messages. Default: 'String'
+     * @property {('String'|'Buffer'|'ArrayBuffer'|'ArrayBufferSafe')} message_type Specifies data type in which to provide incoming websocket messages. ArrayBuffer is a volatile zero-copy view; ArrayBufferSafe is retained. Default: 'String'
      * @property {Number} compression Specifies preset for permessage-deflate compression. Specify one from HyperExpress.compressors.PRESET
      * @property {Number} idle_timeout Specifies interval to automatically timeout/close idle websocket connection in seconds. Default: 32
      * @property {Number} max_backpressure Specifies maximum websocket backpressure allowed in character length. Default: 1024 * 1024
@@ -444,8 +609,8 @@ class Router {
      * @param {WSRouteOptions|WSRouteHandler} options
      * @param {WSRouteHandler} handler
      */
-    ws(pattern, options, handler) {
-        return this._register_route('ws', pattern, options, handler);
+    ws() {
+        return this._register_route('ws', ...arguments);
     }
 
     /* Route getters */
